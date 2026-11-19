@@ -1,7 +1,7 @@
 import express from "express"
 import cors from "cors"
 import "dotenv/config"
-import { MongoClient } from "mongodb"
+import { MongoClient, ObjectId } from "mongodb"
 
 const app = express()
 const port = process.env.PORT || 5000
@@ -39,34 +39,38 @@ const SORTS = {
 const asText = (value) => (typeof value === "string" ? value.trim() : "")
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
+const vendorStages = [
+  {
+    $lookup: {
+      from: "user",
+      localField: "vendorId",
+      foreignField: "_id",
+      as: "vendor",
+    },
+  },
+  { $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true } },
+]
+
+const vendorFields = {
+  "vendor.name": 1,
+  "vendor.businessName": 1,
+  "vendor.image": 1,
+  "vendor.subscriptionPlan": 1,
+}
+
+const cardFields = {
+  serviceName: 1,
+  category: 1,
+  price: 1,
+  location: 1,
+  images: 1,
+  ...vendorFields,
+}
+
 const getServices = (filter, sort, limit) => {
-  const pipeline = [
-    { $match: filter },
-    { $sort: sort },
-    {
-      $lookup: {
-        from: "user",
-        localField: "vendorId",
-        foreignField: "_id",
-        as: "vendor",
-      },
-    },
-    { $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true } },
-    {
-      $project: {
-        serviceName: 1,
-        category: 1,
-        price: 1,
-        location: 1,
-        images: 1,
-        "vendor.name": 1,
-        "vendor.businessName": 1,
-        "vendor.image": 1,
-        "vendor.subscriptionPlan": 1,
-      },
-    },
-  ]
-  if (limit) pipeline.splice(2, 0, { $limit: limit })
+  const pipeline = [{ $match: filter }, { $sort: sort }]
+  if (limit) pipeline.push({ $limit: limit })
+  pipeline.push(...vendorStages, { $project: cardFields })
 
   return servicesCollection.aggregate(pipeline).toArray()
 }
@@ -113,6 +117,36 @@ app.get("/services/category-counts", async (req, res) => {
     .toArray()
 
   res.send(counts)
+})
+
+app.get("/services/:id", async (req, res) => {
+  const { id } = req.params
+  if (!ObjectId.isValid(id) || String(new ObjectId(id)) !== id) {
+    return res.status(400).send({ message: "Invalid service ID" })
+  }
+
+  const [service] = await servicesCollection
+    .aggregate([
+      { $match: { _id: new ObjectId(id), ...publicServiceFilter } },
+      ...vendorStages,
+      {
+        $project: {
+          ...cardFields,
+          description: 1,
+          vendorId: 1,
+          createdAt: 1,
+        },
+      },
+    ])
+    .toArray()
+
+  if (!service) {
+    return res
+      .status(404)
+      .send({ message: "Service not found or no longer available" })
+  }
+
+  res.send(service)
 })
 
 app.use((req, res) => {
