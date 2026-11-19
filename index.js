@@ -2,6 +2,7 @@ import express from "express"
 import cors from "cors"
 import "dotenv/config"
 import { MongoClient, ObjectId } from "mongodb"
+import { createRemoteJWKSet, jwtVerify } from "jose"
 
 const app = express()
 const port = process.env.PORT || 5000
@@ -23,9 +24,51 @@ async function connectToMongoDB() {
 
 const connectedClient = await connectToMongoDB()
 const database = connectedClient.db("wedplandb")
+const usersCollection = database.collection("user")
 const servicesCollection = database.collection("services")
+const bookingsCollection = database.collection("bookings")
 
 const publicServiceFilter = { status: "approved", isActive: true }
+
+const jwks = createRemoteJWKSet(
+  new URL(`${process.env.CLIENT_URL}/api/auth/jwks`)
+)
+
+const verifyToken = async (req, res, next) => {
+  const [scheme, token] = (req.headers.authorization ?? "").split(" ")
+  if (scheme !== "Bearer" || !token) {
+    return res.status(401).send({ message: "Unauthorized" })
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, jwks, {
+      issuer: process.env.CLIENT_URL,
+      audience: process.env.CLIENT_URL,
+    })
+    const user = await usersCollection.findOne({
+      _id: new ObjectId(payload.sub),
+    })
+
+    if (!user) return res.status(401).send({ message: "Unauthorized" })
+    if (user.isBlocked) {
+      return res.status(403).send({ message: "Your account is blocked" })
+    }
+
+    req.user = user
+    next()
+  } catch {
+    res.status(401).send({ message: "Invalid or expired token" })
+  }
+}
+
+const verifyRole = (role) => (req, res, next) => {
+  if (req.user.role !== role) {
+    return res.status(403).send({ message: "Forbidden" })
+  }
+  next()
+}
+
+const verifyCustomer = verifyRole("customer")
 
 app.get("/", (req, res) => {
   res.send("WedPlan server is running")
@@ -147,6 +190,74 @@ app.get("/services/:id", async (req, res) => {
   }
 
   res.send(service)
+})
+
+app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
+  const serviceId = asText(req.body.serviceId)
+  const eventDate = asText(req.body.eventDate)
+  const eventLocation = asText(req.body.eventLocation)
+  const message = asText(req.body.message)
+
+  if (!ObjectId.isValid(serviceId) || String(new ObjectId(serviceId)) !== serviceId) {
+    return res.status(400).send({ message: "Invalid service ID" })
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(eventDate) || Number.isNaN(Date.parse(eventDate))) {
+    return res.status(400).send({ message: "Please provide a valid event date" })
+  }
+  if (eventDate < new Date().toISOString().slice(0, 10)) {
+    return res.status(400).send({ message: "Event date cannot be in the past" })
+  }
+  if (eventLocation.length < 2 || eventLocation.length > 200) {
+    return res
+      .status(400)
+      .send({ message: "Event location must be 2 to 200 characters" })
+  }
+  if (message.length > 1000) {
+    return res
+      .status(400)
+      .send({ message: "Message must be 1000 characters or fewer" })
+  }
+
+  const service = await servicesCollection.findOne({
+    _id: new ObjectId(serviceId),
+    ...publicServiceFilter,
+  })
+  if (!service) {
+    return res
+      .status(404)
+      .send({ message: "Service not found or no longer available" })
+  }
+  if (String(service.vendorId) === String(req.user._id)) {
+    return res
+      .status(403)
+      .send({ message: "You cannot book your own service" })
+  }
+
+  const duplicate = await bookingsCollection.findOne({
+    serviceId: service._id,
+    customerId: req.user._id,
+    eventDate,
+    status: { $in: ["pending", "accepted"] },
+  })
+  if (duplicate) {
+    return res.status(409).send({
+      message: "You already have an active request for this service on that date",
+    })
+  }
+
+  const booking = {
+    serviceId: service._id,
+    vendorId: service.vendorId,
+    customerId: req.user._id,
+    eventDate,
+    eventLocation,
+    message,
+    status: "pending",
+    createdAt: new Date(),
+  }
+  const result = await bookingsCollection.insertOne(booking)
+
+  res.status(201).send({ _id: result.insertedId, ...booking })
 })
 
 app.use((req, res) => {
