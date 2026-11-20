@@ -536,6 +536,83 @@ app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
   res.status(201).send({ _id: result.insertedId, ...booking })
 })
 
+app.get("/vendor/bookings", verifyToken, verifyVendor, async (req, res) => {
+  const bookings = await bookingsCollection
+    .aggregate([
+      { $match: { vendorId: req.user._id } },
+      { $sort: { createdAt: -1 } },
+      {
+        $lookup: {
+          from: "user",
+          localField: "customerId",
+          foreignField: "_id",
+          as: "customer",
+        },
+      },
+      {
+        $lookup: {
+          from: "services",
+          localField: "serviceId",
+          foreignField: "_id",
+          as: "service",
+        },
+      },
+      { $unwind: { path: "$customer", preserveNullAndEmptyArrays: true } },
+      { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          eventDate: 1,
+          eventLocation: 1,
+          message: 1,
+          status: 1,
+          createdAt: 1,
+          "customer.name": 1,
+          "customer.email": 1,
+          "customer.image": 1,
+          "service.serviceName": 1,
+          "service.category": 1,
+          "service.images": 1,
+        },
+      },
+    ])
+    .toArray()
+
+  res.send(bookings)
+})
+
+app.patch(
+  "/bookings/:id/status",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    if (!isObjectId(req.params.id)) {
+      return res.status(400).send({ message: "Invalid booking ID" })
+    }
+
+    const status = asText(req.body.status)
+    if (!["accepted", "rejected"].includes(status)) {
+      return res
+        .status(400)
+        .send({ message: "Status must be accepted or rejected" })
+    }
+
+    const filter = { _id: new ObjectId(req.params.id), vendorId: req.user._id }
+    const updated = await bookingsCollection.findOneAndUpdate(
+      { ...filter, status: "pending" },
+      { $set: { status, updatedAt: new Date() } }
+    )
+    if (updated) return res.send({ status })
+
+    const booking = await bookingsCollection.findOne(filter)
+    if (!booking) {
+      return res.status(404).send({ message: "Booking request not found" })
+    }
+    res.status(409).send({
+      message: `This request is already ${booking.status} and cannot be changed`,
+    })
+  }
+)
+
 app.use((req, res) => {
   res.status(404).send({ message: "Route not found" })
 })
