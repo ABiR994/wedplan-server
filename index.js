@@ -182,6 +182,36 @@ app.get("/overview", verifyToken, async (req, res) => {
   })
 })
 
+app.patch("/profile", verifyToken, async (req, res) => {
+  const name = asText(req.body.name)
+  const image = asText(req.body.image)
+  const businessName = asText(req.body.businessName)
+
+  if (name.length < 2 || name.length > 80) {
+    return res.status(400).send({ message: "Name must be 2 to 80 characters" })
+  }
+  if (businessName.length > 100) {
+    return res
+      .status(400)
+      .send({ message: "Business name must be 100 characters or fewer" })
+  }
+  if (image) {
+    try {
+      if (new URL(image).protocol !== "https:") throw new Error()
+    } catch {
+      return res.status(400).send({ message: "Invalid image URL" })
+    }
+  }
+
+  const updates = { name, updatedAt: new Date() }
+  if (image) updates.image = image
+  if (req.user.role === "vendor") updates.businessName = businessName
+
+  await usersCollection.updateOne({ _id: req.user._id }, { $set: updates })
+
+  res.send({ message: "Profile updated successfully" })
+})
+
 app.get("/services", async (req, res) => {
   const search = asText(req.query.q)
   const category = asText(req.query.category)
