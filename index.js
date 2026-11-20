@@ -613,6 +613,82 @@ app.patch(
   }
 )
 
+app.get("/customer/bookings", verifyToken, verifyCustomer, async (req, res) => {
+  const bookings = await bookingsCollection
+    .aggregate([
+      { $match: { customerId: req.user._id } },
+      { $sort: { createdAt: -1 } },
+      {
+        $lookup: {
+          from: "services",
+          localField: "serviceId",
+          foreignField: "_id",
+          as: "service",
+        },
+      },
+      {
+        $lookup: {
+          from: "user",
+          localField: "vendorId",
+          foreignField: "_id",
+          as: "vendor",
+        },
+      },
+      { $unwind: { path: "$service", preserveNullAndEmptyArrays: true } },
+      { $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          serviceId: 1,
+          eventDate: 1,
+          eventLocation: 1,
+          message: 1,
+          status: 1,
+          createdAt: 1,
+          "service.serviceName": 1,
+          "service.category": 1,
+          "service.images": 1,
+          "service.price": 1,
+          "service.location": 1,
+          "vendor.name": 1,
+          "vendor.businessName": 1,
+          "vendor.image": 1,
+        },
+      },
+    ])
+    .toArray()
+
+  res.send(bookings)
+})
+
+app.patch(
+  "/bookings/:id/cancel",
+  verifyToken,
+  verifyCustomer,
+  async (req, res) => {
+    if (!isObjectId(req.params.id)) {
+      return res.status(400).send({ message: "Invalid booking ID" })
+    }
+
+    const filter = {
+      _id: new ObjectId(req.params.id),
+      customerId: req.user._id,
+    }
+    const updated = await bookingsCollection.findOneAndUpdate(
+      { ...filter, status: "pending" },
+      { $set: { status: "cancelled", updatedAt: new Date() } }
+    )
+    if (updated) return res.send({ status: "cancelled" })
+
+    const booking = await bookingsCollection.findOne(filter)
+    if (!booking) {
+      return res.status(404).send({ message: "Booking not found" })
+    }
+    res.status(409).send({
+      message: `This booking is already ${booking.status} and cannot be cancelled`,
+    })
+  }
+)
+
 app.use((req, res) => {
   res.status(404).send({ message: "Route not found" })
 })
