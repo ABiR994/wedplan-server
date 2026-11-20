@@ -96,6 +96,9 @@ const SORTS = {
   price_desc: { price: -1, createdAt: -1 },
 }
 
+const isObjectId = (value) =>
+  ObjectId.isValid(value) && String(new ObjectId(value)) === value
+
 const asText = (value) => (typeof value === "string" ? value.trim() : "")
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
@@ -269,7 +272,7 @@ app.get("/services/category-counts", async (req, res) => {
 
 app.get("/services/:id", async (req, res) => {
   const { id } = req.params
-  if (!ObjectId.isValid(id) || String(new ObjectId(id)) !== id) {
+  if (!isObjectId(id)) {
     return res.status(400).send({ message: "Invalid service ID" })
   }
 
@@ -297,70 +300,97 @@ app.get("/services/:id", async (req, res) => {
   res.send(service)
 })
 
-app.post("/services", verifyToken, verifyVendor, async (req, res) => {
-  const serviceName = asText(req.body.serviceName)
-  const category = asText(req.body.category)
-  const description = asText(req.body.description)
-  const location = asText(req.body.location)
-  const price = Number(req.body.price)
-  const images = Array.isArray(req.body.images) ? req.body.images : []
+const isValidImage = (image) => {
+  if (typeof image !== "string") return false
+  if (image.startsWith("/images/")) return true
+  try {
+    return new URL(image).protocol === "https:"
+  } catch {
+    return false
+  }
+}
+
+const validateService = (body) => {
+  const serviceName = asText(body.serviceName)
+  const category = asText(body.category)
+  const description = asText(body.description)
+  const location = asText(body.location)
+  const price = Number(body.price)
+  const images = Array.isArray(body.images) ? body.images : []
 
   if (serviceName.length < 3 || serviceName.length > 100) {
-    return res
-      .status(400)
-      .send({ message: "Service name must be 3 to 100 characters" })
+    return { error: "Service name must be 3 to 100 characters" }
   }
   if (!CATEGORIES.includes(category)) {
-    return res.status(400).send({ message: "Please select a valid category" })
+    return { error: "Please select a valid category" }
   }
   if (description.length < 20 || description.length > 2000) {
-    return res
-      .status(400)
-      .send({ message: "Description must be 20 to 2000 characters" })
+    return { error: "Description must be 20 to 2000 characters" }
   }
   if (!Number.isFinite(price) || price <= 0 || price > 1000000) {
-    return res.status(400).send({ message: "Please enter a valid price" })
+    return { error: "Please enter a valid price" }
   }
   if (location.length < 2 || location.length > 100) {
-    return res
-      .status(400)
-      .send({ message: "Location must be 2 to 100 characters" })
+    return { error: "Location must be 2 to 100 characters" }
+  }
+  if (images.length < 1 || images.length > 4 || !images.every(isValidImage)) {
+    return { error: "Please provide 1 to 4 valid service images" }
   }
 
-  const validImages = images.every((image) => {
-    try {
-      return typeof image === "string" && new URL(image).protocol === "https:"
-    } catch {
-      return false
-    }
-  })
-  if (images.length < 1 || images.length > 4 || !validImages) {
-    return res
-      .status(400)
-      .send({ message: "Please upload 1 to 4 valid service images" })
+  return {
+    data: { serviceName, category, description, price, location, images },
   }
+}
+
+const countActiveServices = (vendorId, excludeId) =>
+  servicesCollection.countDocuments({
+    vendorId,
+    isActive: true,
+    status: { $in: ["pending", "approved"] },
+    ...(excludeId && { _id: { $ne: excludeId } }),
+  })
+
+const freePlanLimitMessage = `Free plan allows up to ${FREE_PLAN_LIMIT} active services. Upgrade to Premium to add more.`
+
+const getOwnedService = async (req, res) => {
+  if (!isObjectId(req.params.id)) {
+    res.status(400).send({ message: "Invalid service ID" })
+    return null
+  }
+
+  const service = await servicesCollection.findOne({
+    _id: new ObjectId(req.params.id),
+    vendorId: req.user._id,
+  })
+  if (!service) {
+    res.status(404).send({ message: "Service not found" })
+    return null
+  }
+  return service
+}
+
+app.get("/vendor/services", verifyToken, verifyVendor, async (req, res) => {
+  const services = await servicesCollection
+    .find({ vendorId: req.user._id })
+    .sort({ createdAt: -1 })
+    .toArray()
+
+  res.send(services)
+})
+
+app.post("/services", verifyToken, verifyVendor, async (req, res) => {
+  const { error, data } = validateService(req.body)
+  if (error) return res.status(400).send({ message: error })
 
   if (!isPremium(req.user)) {
-    const activeCount = await servicesCollection.countDocuments({
-      vendorId: req.user._id,
-      isActive: true,
-      status: { $in: ["pending", "approved"] },
-    })
-    if (activeCount >= FREE_PLAN_LIMIT) {
-      return res.status(403).send({
-        message: `Free plan allows up to ${FREE_PLAN_LIMIT} active services. Upgrade to Premium to add more.`,
-      })
+    if ((await countActiveServices(req.user._id)) >= FREE_PLAN_LIMIT) {
+      return res.status(403).send({ message: freePlanLimitMessage })
     }
   }
 
   const service = {
     vendorId: req.user._id,
-    serviceName,
-    category,
-    description,
-    price,
-    location,
-    images,
+    ...data,
     status: "pending",
     isActive: true,
     createdAt: new Date(),
@@ -370,13 +400,81 @@ app.post("/services", verifyToken, verifyVendor, async (req, res) => {
   res.status(201).send({ _id: result.insertedId, ...service })
 })
 
+app.patch("/services/:id", verifyToken, verifyVendor, async (req, res) => {
+  const service = await getOwnedService(req, res)
+  if (!service) return
+
+  const { error, data } = validateService(req.body)
+  if (error) return res.status(400).send({ message: error })
+
+  const updates = { ...data, updatedAt: new Date() }
+
+  if (service.status === "rejected") {
+    const needsSlot = service.isActive && !isPremium(req.user)
+    if (
+      needsSlot &&
+      (await countActiveServices(req.user._id, service._id)) >= FREE_PLAN_LIMIT
+    ) {
+      return res.status(403).send({ message: freePlanLimitMessage })
+    }
+    updates.status = "pending"
+  }
+
+  await servicesCollection.updateOne({ _id: service._id }, { $set: updates })
+
+  res.send({ ...service, ...updates })
+})
+
+app.patch(
+  "/services/:id/availability",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    const service = await getOwnedService(req, res)
+    if (!service) return
+
+    const { isActive } = req.body
+    if (typeof isActive !== "boolean") {
+      return res.status(400).send({ message: "isActive must be true or false" })
+    }
+
+    const needsSlot =
+      isActive &&
+      !service.isActive &&
+      service.status !== "rejected" &&
+      !isPremium(req.user)
+    if (
+      needsSlot &&
+      (await countActiveServices(req.user._id, service._id)) >= FREE_PLAN_LIMIT
+    ) {
+      return res.status(403).send({ message: freePlanLimitMessage })
+    }
+
+    await servicesCollection.updateOne(
+      { _id: service._id },
+      { $set: { isActive, updatedAt: new Date() } }
+    )
+
+    res.send({ isActive })
+  }
+)
+
+app.delete("/services/:id", verifyToken, verifyVendor, async (req, res) => {
+  const service = await getOwnedService(req, res)
+  if (!service) return
+
+  await servicesCollection.deleteOne({ _id: service._id })
+
+  res.send({ message: "Service deleted successfully" })
+})
+
 app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
   const serviceId = asText(req.body.serviceId)
   const eventDate = asText(req.body.eventDate)
   const eventLocation = asText(req.body.eventLocation)
   const message = asText(req.body.message)
 
-  if (!ObjectId.isValid(serviceId) || String(new ObjectId(serviceId)) !== serviceId) {
+  if (!isObjectId(serviceId)) {
     return res.status(400).send({ message: "Invalid service ID" })
   }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(eventDate) || Number.isNaN(Date.parse(eventDate))) {
