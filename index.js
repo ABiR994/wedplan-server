@@ -31,6 +31,17 @@ const transactionsCollection = database.collection("transactions")
 
 const publicServiceFilter = { status: "approved", isActive: true }
 
+const CATEGORIES = [
+  "Photography & Videography",
+  "Wedding Venues",
+  "Decoration & Florist",
+  "Catering Services",
+  "Makeup & Styling",
+  "Wedding Fashion",
+]
+
+const FREE_PLAN_LIMIT = 3
+
 const jwks = createRemoteJWKSet(
   new URL(`${process.env.CLIENT_URL}/api/auth/jwks`)
 )
@@ -70,6 +81,11 @@ const verifyRole = (role) => (req, res, next) => {
 }
 
 const verifyCustomer = verifyRole("customer")
+const verifyVendor = verifyRole("vendor")
+
+const isPremium = (user) =>
+  user.subscriptionPlan === "premium" &&
+  (!user.subscriptionExpiresAt || new Date(user.subscriptionExpiresAt) > new Date())
 
 app.get("/", (req, res) => {
   res.send("WedPlan server is running")
@@ -131,17 +147,12 @@ app.get("/overview", verifyToken, async (req, res) => {
         bookingsCollection.countDocuments({ vendorId: _id, status: "accepted" }),
       ])
 
-    const expiresAt = req.user.subscriptionExpiresAt
-    const isPremium =
-      req.user.subscriptionPlan === "premium" &&
-      (!expiresAt || new Date(expiresAt) > new Date())
-
     return res.send({
       totalServices,
       activeServices,
       pendingRequests,
       acceptedBookings,
-      plan: isPremium ? "premium" : "free",
+      plan: isPremium(req.user) ? "premium" : "free",
     })
   }
 
@@ -284,6 +295,79 @@ app.get("/services/:id", async (req, res) => {
   }
 
   res.send(service)
+})
+
+app.post("/services", verifyToken, verifyVendor, async (req, res) => {
+  const serviceName = asText(req.body.serviceName)
+  const category = asText(req.body.category)
+  const description = asText(req.body.description)
+  const location = asText(req.body.location)
+  const price = Number(req.body.price)
+  const images = Array.isArray(req.body.images) ? req.body.images : []
+
+  if (serviceName.length < 3 || serviceName.length > 100) {
+    return res
+      .status(400)
+      .send({ message: "Service name must be 3 to 100 characters" })
+  }
+  if (!CATEGORIES.includes(category)) {
+    return res.status(400).send({ message: "Please select a valid category" })
+  }
+  if (description.length < 20 || description.length > 2000) {
+    return res
+      .status(400)
+      .send({ message: "Description must be 20 to 2000 characters" })
+  }
+  if (!Number.isFinite(price) || price <= 0 || price > 1000000) {
+    return res.status(400).send({ message: "Please enter a valid price" })
+  }
+  if (location.length < 2 || location.length > 100) {
+    return res
+      .status(400)
+      .send({ message: "Location must be 2 to 100 characters" })
+  }
+
+  const validImages = images.every((image) => {
+    try {
+      return typeof image === "string" && new URL(image).protocol === "https:"
+    } catch {
+      return false
+    }
+  })
+  if (images.length < 1 || images.length > 4 || !validImages) {
+    return res
+      .status(400)
+      .send({ message: "Please upload 1 to 4 valid service images" })
+  }
+
+  if (!isPremium(req.user)) {
+    const activeCount = await servicesCollection.countDocuments({
+      vendorId: req.user._id,
+      isActive: true,
+      status: { $in: ["pending", "approved"] },
+    })
+    if (activeCount >= FREE_PLAN_LIMIT) {
+      return res.status(403).send({
+        message: `Free plan allows up to ${FREE_PLAN_LIMIT} active services. Upgrade to Premium to add more.`,
+      })
+    }
+  }
+
+  const service = {
+    vendorId: req.user._id,
+    serviceName,
+    category,
+    description,
+    price,
+    location,
+    images,
+    status: "pending",
+    isActive: true,
+    createdAt: new Date(),
+  }
+  const result = await servicesCollection.insertOne(service)
+
+  res.status(201).send({ _id: result.insertedId, ...service })
 })
 
 app.post("/bookings", verifyToken, verifyCustomer, async (req, res) => {
