@@ -27,6 +27,7 @@ const database = connectedClient.db("wedplandb")
 const usersCollection = database.collection("user")
 const servicesCollection = database.collection("services")
 const bookingsCollection = database.collection("bookings")
+const transactionsCollection = database.collection("transactions")
 
 const publicServiceFilter = { status: "approved", isActive: true }
 
@@ -117,6 +118,69 @@ const getServices = (filter, sort, limit) => {
 
   return servicesCollection.aggregate(pipeline).toArray()
 }
+
+app.get("/overview", verifyToken, async (req, res) => {
+  const { _id, role } = req.user
+
+  if (role === "vendor") {
+    const [totalServices, activeServices, pendingRequests, acceptedBookings] =
+      await Promise.all([
+        servicesCollection.countDocuments({ vendorId: _id }),
+        servicesCollection.countDocuments({ vendorId: _id, ...publicServiceFilter }),
+        bookingsCollection.countDocuments({ vendorId: _id, status: "pending" }),
+        bookingsCollection.countDocuments({ vendorId: _id, status: "accepted" }),
+      ])
+
+    const expiresAt = req.user.subscriptionExpiresAt
+    const isPremium =
+      req.user.subscriptionPlan === "premium" &&
+      (!expiresAt || new Date(expiresAt) > new Date())
+
+    return res.send({
+      totalServices,
+      activeServices,
+      pendingRequests,
+      acceptedBookings,
+      plan: isPremium ? "premium" : "free",
+    })
+  }
+
+  if (role === "customer") {
+    const [totalBookings, pending, accepted, rejected] = await Promise.all([
+      bookingsCollection.countDocuments({ customerId: _id }),
+      bookingsCollection.countDocuments({ customerId: _id, status: "pending" }),
+      bookingsCollection.countDocuments({ customerId: _id, status: "accepted" }),
+      bookingsCollection.countDocuments({ customerId: _id, status: "rejected" }),
+    ])
+
+    return res.send({ totalBookings, pending, accepted, rejected })
+  }
+
+  const [
+    totalUsers,
+    totalVendors,
+    totalCustomers,
+    totalServices,
+    pendingServices,
+    totalTransactions,
+  ] = await Promise.all([
+    usersCollection.countDocuments({}),
+    usersCollection.countDocuments({ role: "vendor" }),
+    usersCollection.countDocuments({ role: "customer" }),
+    servicesCollection.countDocuments({}),
+    servicesCollection.countDocuments({ status: "pending" }),
+    transactionsCollection.countDocuments({}),
+  ])
+
+  res.send({
+    totalUsers,
+    totalVendors,
+    totalCustomers,
+    totalServices,
+    pendingServices,
+    totalTransactions,
+  })
+})
 
 app.get("/services", async (req, res) => {
   const search = asText(req.query.q)
