@@ -6,6 +6,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose"
 import Stripe from "stripe"
 
 const app = express()
+app.disable("x-powered-by")
 const port = process.env.PORT || 5000
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
@@ -16,6 +17,10 @@ app.post(
 )
 
 app.use(express.json())
+app.use((req, res, next) => {
+  req.body ??= {}
+  next()
+})
 app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }))
 
 const client = new MongoClient(process.env.MONGODB_URI)
@@ -49,6 +54,17 @@ const CATEGORIES = [
 ]
 
 const SERVICE_STATUSES = ["pending", "approved", "rejected"]
+
+const IMAGE_HOSTS = ["i.ibb.co", "i.ibb.co.com"]
+
+const isHostedImage = (value) => {
+  try {
+    const url = new URL(value)
+    return url.protocol === "https:" && IMAGE_HOSTS.includes(url.hostname)
+  } catch {
+    return false
+  }
+}
 
 const FREE_PLAN_LIMIT = 3
 const PREMIUM_PRICE_USD = 19
@@ -222,12 +238,8 @@ app.patch("/profile", verifyToken, async (req, res) => {
       .status(400)
       .send({ message: "Business name must be 100 characters or fewer" })
   }
-  if (image) {
-    try {
-      if (new URL(image).protocol !== "https:") throw new Error()
-    } catch {
-      return res.status(400).send({ message: "Invalid image URL" })
-    }
+  if (image && !isHostedImage(image)) {
+    return res.status(400).send({ message: "Invalid image URL" })
   }
 
   const updates = { name, updatedAt: new Date() }
@@ -313,15 +325,9 @@ app.get("/services/:id", async (req, res) => {
   res.send(service)
 })
 
-const isValidImage = (image) => {
-  if (typeof image !== "string") return false
-  if (image.startsWith("/images/")) return true
-  try {
-    return new URL(image).protocol === "https:"
-  } catch {
-    return false
-  }
-}
+const isValidImage = (image) =>
+  typeof image === "string" &&
+  (image.startsWith("/images/services/") || isHostedImage(image))
 
 const validateService = (body) => {
   const serviceName = asText(body.serviceName)
@@ -1111,6 +1117,10 @@ app.use((req, res) => {
 })
 
 app.use((err, req, res, next) => {
+  if (err.type === "entity.parse.failed" || err.type === "entity.too.large") {
+    return res.status(400).send({ message: "Invalid request body" })
+  }
+
   console.error(err)
   res.status(500).send({ message: "Something went wrong" })
 })
