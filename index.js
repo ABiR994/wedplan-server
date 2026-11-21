@@ -48,6 +48,8 @@ const CATEGORIES = [
   "Wedding Fashion",
 ]
 
+const SERVICE_STATUSES = ["pending", "approved", "rejected"]
+
 const FREE_PLAN_LIMIT = 3
 const PREMIUM_PRICE_USD = 19
 const GRACE_PERIOD_MS = 24 * 60 * 60 * 1000
@@ -980,6 +982,94 @@ app.patch(
     )
 
     res.send({ isBlocked })
+  }
+)
+
+app.get("/admin/services", verifyToken, verifyAdmin, async (req, res) => {
+  const search = asText(req.query.q)
+  const status = asText(req.query.status)
+  const category = asText(req.query.category)
+
+  const filter = {}
+  if (search) {
+    filter.serviceName = { $regex: escapeRegex(search), $options: "i" }
+  }
+  if (SERVICE_STATUSES.includes(status)) filter.status = status
+  if (CATEGORIES.includes(category)) filter.category = category
+
+  const services = await servicesCollection
+    .aggregate([
+      { $match: filter },
+      { $sort: { createdAt: -1 } },
+      { $limit: 200 },
+      ...vendorStages,
+      {
+        $project: {
+          serviceName: 1,
+          category: 1,
+          description: 1,
+          price: 1,
+          location: 1,
+          images: 1,
+          status: 1,
+          isActive: 1,
+          createdAt: 1,
+          "vendor.name": 1,
+          "vendor.businessName": 1,
+          "vendor.email": 1,
+        },
+      },
+    ])
+    .toArray()
+
+  res.send(services)
+})
+
+app.patch(
+  "/admin/services/:id/status",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    if (!isObjectId(req.params.id)) {
+      return res.status(400).send({ message: "Invalid service ID" })
+    }
+
+    const status = asText(req.body.status)
+    if (!["approved", "rejected"].includes(status)) {
+      return res
+        .status(400)
+        .send({ message: "Status must be approved or rejected" })
+    }
+
+    const result = await servicesCollection.updateOne(
+      { _id: new ObjectId(req.params.id) },
+      { $set: { status, updatedAt: new Date() } }
+    )
+    if (!result.matchedCount) {
+      return res.status(404).send({ message: "Service not found" })
+    }
+
+    res.send({ status })
+  }
+)
+
+app.delete(
+  "/admin/services/:id",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    if (!isObjectId(req.params.id)) {
+      return res.status(400).send({ message: "Invalid service ID" })
+    }
+
+    const result = await servicesCollection.deleteOne({
+      _id: new ObjectId(req.params.id),
+    })
+    if (!result.deletedCount) {
+      return res.status(404).send({ message: "Service not found" })
+    }
+
+    res.send({ message: "Service deleted successfully" })
   }
 )
 
