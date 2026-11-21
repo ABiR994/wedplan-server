@@ -3,9 +3,17 @@ import cors from "cors"
 import "dotenv/config"
 import { MongoClient, ObjectId } from "mongodb"
 import { createRemoteJWKSet, jwtVerify } from "jose"
+import Stripe from "stripe"
 
 const app = express()
 const port = process.env.PORT || 5000
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
+
+app.post(
+  "/payments/webhook",
+  express.raw({ type: "application/json" }),
+  handleStripeWebhook
+)
 
 app.use(express.json())
 app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }))
@@ -41,6 +49,8 @@ const CATEGORIES = [
 ]
 
 const FREE_PLAN_LIMIT = 3
+const PREMIUM_PRICE_USD = 19
+const GRACE_PERIOD_MS = 24 * 60 * 60 * 1000
 
 const jwks = createRemoteJWKSet(
   new URL(`${process.env.CLIENT_URL}/api/auth/jwks`)
@@ -686,6 +696,195 @@ app.patch(
     res.status(409).send({
       message: `This booking is already ${booking.status} and cannot be cancelled`,
     })
+  }
+)
+
+const getPeriodEnd = (subscription) => {
+  const end =
+    subscription.items?.data?.[0]?.current_period_end ??
+    subscription.current_period_end
+
+  return new Date(end * 1000 + GRACE_PERIOD_MS)
+}
+
+async function activatePremium(session) {
+  const vendorId = session.metadata?.vendorId
+  if (
+    session.mode !== "subscription" ||
+    session.payment_status !== "paid" ||
+    !isObjectId(vendorId)
+  ) {
+    return
+  }
+
+  const subscription = await stripe.subscriptions.retrieve(session.subscription)
+
+  await transactionsCollection.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $setOnInsert: {
+        vendorId: new ObjectId(vendorId),
+        plan: "premium",
+        amount: session.amount_total / 100,
+        currency: session.currency,
+        stripeSessionId: session.id,
+        stripeSubscriptionId: session.subscription,
+        status: "paid",
+        createdAt: new Date(),
+      },
+    },
+    { upsert: true }
+  )
+
+  await usersCollection.updateOne(
+    { _id: new ObjectId(vendorId), role: "vendor" },
+    {
+      $set: {
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt: getPeriodEnd(subscription),
+        stripeCustomerId: session.customer,
+      },
+    }
+  )
+}
+
+async function renewPremium(invoice) {
+  const subscriptionId =
+    invoice.parent?.subscription_details?.subscription ?? invoice.subscription
+  if (invoice.billing_reason !== "subscription_cycle" || !subscriptionId) return
+
+  const subscription = await stripe.subscriptions.retrieve(subscriptionId)
+  const vendorId = subscription.metadata?.vendorId
+  if (!isObjectId(vendorId)) return
+
+  await usersCollection.updateOne(
+    { _id: new ObjectId(vendorId), role: "vendor" },
+    {
+      $set: {
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt: getPeriodEnd(subscription),
+      },
+    }
+  )
+}
+
+async function cancelPremium(subscription) {
+  const vendorId = subscription.metadata?.vendorId
+  if (!isObjectId(vendorId)) return
+
+  await usersCollection.updateOne(
+    { _id: new ObjectId(vendorId), role: "vendor" },
+    { $set: { subscriptionPlan: "free" }, $unset: { subscriptionExpiresAt: "" } }
+  )
+}
+
+async function handleStripeWebhook(req, res) {
+  let event
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET
+    )
+  } catch {
+    return res.status(400).send({ message: "Invalid webhook signature" })
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      await activatePremium(event.data.object)
+    } else if (event.type === "invoice.paid") {
+      await renewPremium(event.data.object)
+    } else if (event.type === "customer.subscription.deleted") {
+      await cancelPremium(event.data.object)
+    }
+  } catch (error) {
+    console.error(error)
+    return res.status(500).send({ message: "Webhook handling failed" })
+  }
+
+  res.send({ received: true })
+}
+
+app.get("/payments/subscription", verifyToken, verifyVendor, (req, res) => {
+  res.send({
+    plan: isPremium(req.user) ? "premium" : "free",
+    expiresAt: req.user.subscriptionExpiresAt ?? null,
+    canManage: Boolean(req.user.stripeCustomerId),
+  })
+})
+
+app.post(
+  "/payments/create-checkout-session",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    if (isPremium(req.user)) {
+      return res
+        .status(409)
+        .send({ message: "You already have an active Premium subscription" })
+    }
+
+    const vendorId = String(req.user._id)
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      ...(req.user.stripeCustomerId
+        ? { customer: req.user.stripeCustomerId }
+        : { customer_email: req.user.email }),
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: PREMIUM_PRICE_USD * 100,
+            recurring: { interval: "month" },
+            product_data: {
+              name: "WedPlan Premium",
+              description: "Unlimited services and the Premium Vendor badge",
+            },
+          },
+        },
+      ],
+      client_reference_id: vendorId,
+      metadata: { vendorId },
+      subscription_data: { metadata: { vendorId } },
+      success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+    })
+
+    res.send({ url: session.url })
+  }
+)
+
+app.get("/payments/status", verifyToken, verifyVendor, async (req, res) => {
+  const sessionId = asText(req.query.session_id)
+  if (!sessionId) {
+    return res.status(400).send({ message: "Session ID is required" })
+  }
+
+  const transaction = await transactionsCollection.findOne({
+    stripeSessionId: sessionId,
+    vendorId: req.user._id,
+  })
+
+  res.send({ status: transaction ? "paid" : "pending" })
+})
+
+app.post(
+  "/payments/portal-session",
+  verifyToken,
+  verifyVendor,
+  async (req, res) => {
+    if (!req.user.stripeCustomerId) {
+      return res.status(400).send({ message: "No billing account found" })
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: req.user.stripeCustomerId,
+      return_url: `${process.env.CLIENT_URL}/dashboard/vendor/subscription`,
+    })
+
+    res.send({ url: session.url })
   }
 )
 
