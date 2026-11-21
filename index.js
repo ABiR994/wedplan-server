@@ -92,6 +92,7 @@ const verifyRole = (role) => (req, res, next) => {
 
 const verifyCustomer = verifyRole("customer")
 const verifyVendor = verifyRole("vendor")
+const verifyAdmin = verifyRole("admin")
 
 const isPremium = (user) =>
   user.subscriptionPlan === "premium" &&
@@ -885,6 +886,100 @@ app.post(
     })
 
     res.send({ url: session.url })
+  }
+)
+
+const ROLES = ["customer", "vendor", "admin"]
+
+const userFields = {
+  name: 1,
+  email: 1,
+  image: 1,
+  role: 1,
+  isBlocked: 1,
+  businessName: 1,
+  subscriptionPlan: 1,
+  subscriptionExpiresAt: 1,
+  createdAt: 1,
+}
+
+app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  const search = asText(req.query.q)
+  const role = asText(req.query.role)
+
+  const filter = {}
+  if (ROLES.includes(role)) filter.role = role
+  if (search) {
+    const pattern = { $regex: escapeRegex(search), $options: "i" }
+    filter.$or = [{ name: pattern }, { email: pattern }]
+  }
+
+  const users = await usersCollection
+    .find(filter, { projection: userFields })
+    .sort({ createdAt: -1 })
+    .limit(200)
+    .toArray()
+
+  res.send(users)
+})
+
+app.get("/admin/users/:id", verifyToken, verifyAdmin, async (req, res) => {
+  if (!isObjectId(req.params.id)) {
+    return res.status(400).send({ message: "Invalid user ID" })
+  }
+
+  const user = await usersCollection.findOne(
+    { _id: new ObjectId(req.params.id) },
+    { projection: userFields }
+  )
+  if (!user) return res.status(404).send({ message: "User not found" })
+
+  const stats = {}
+  if (user.role === "vendor") {
+    stats.totalServices = await servicesCollection.countDocuments({
+      vendorId: user._id,
+    })
+    stats.totalBookingRequests = await bookingsCollection.countDocuments({
+      vendorId: user._id,
+    })
+  }
+  if (user.role === "customer") {
+    stats.totalBookings = await bookingsCollection.countDocuments({
+      customerId: user._id,
+    })
+  }
+
+  res.send({ ...user, stats })
+})
+
+app.patch(
+  "/admin/users/:id/block",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    if (!isObjectId(req.params.id)) {
+      return res.status(400).send({ message: "Invalid user ID" })
+    }
+
+    const { isBlocked } = req.body
+    if (typeof isBlocked !== "boolean") {
+      return res.status(400).send({ message: "isBlocked must be true or false" })
+    }
+
+    const user = await usersCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    })
+    if (!user) return res.status(404).send({ message: "User not found" })
+    if (user.role === "admin") {
+      return res.status(403).send({ message: "Admin accounts cannot be blocked" })
+    }
+
+    await usersCollection.updateOne(
+      { _id: user._id },
+      { $set: { isBlocked, updatedAt: new Date() } }
+    )
+
+    res.send({ isBlocked })
   }
 )
 
