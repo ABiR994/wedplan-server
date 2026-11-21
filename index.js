@@ -1073,6 +1073,39 @@ app.delete(
   }
 )
 
+app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
+  const transactions = await transactionsCollection
+    .aggregate([
+      { $sort: { createdAt: -1 } },
+      { $limit: 200 },
+      {
+        $lookup: {
+          from: "user",
+          localField: "vendorId",
+          foreignField: "_id",
+          as: "vendor",
+        },
+      },
+      { $unwind: { path: "$vendor", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          plan: 1,
+          amount: 1,
+          currency: 1,
+          status: 1,
+          createdAt: 1,
+          "vendor.name": 1,
+          "vendor.businessName": 1,
+          "vendor.email": 1,
+          "vendor.image": 1,
+        },
+      },
+    ])
+    .toArray()
+
+  res.send(transactions)
+})
+
 app.use((req, res) => {
   res.status(404).send({ message: "Route not found" })
 })
