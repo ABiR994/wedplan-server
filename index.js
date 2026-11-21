@@ -1,6 +1,7 @@
 import express from "express"
 import cors from "cors"
 import "dotenv/config"
+import { attachDatabasePool } from "@vercel/functions"
 import { MongoClient, ObjectId } from "mongodb"
 import { createRemoteJWKSet, jwtVerify } from "jose"
 import Stripe from "stripe"
@@ -23,20 +24,13 @@ app.use((req, res, next) => {
 })
 app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }))
 
-const client = new MongoClient(process.env.MONGODB_URI)
+const client = new MongoClient(process.env.MONGODB_URI, {
+  maxIdleTimeMS: 5000,
+  serverSelectionTimeoutMS: 10000,
+})
+attachDatabasePool(client)
 
-async function connectToMongoDB() {
-  try {
-    await client.connect()
-    console.log("Connected to MongoDB")
-    return client
-  } catch (err) {
-    console.dir(err)
-  }
-}
-
-const connectedClient = await connectToMongoDB()
-const database = connectedClient.db("wedplandb")
+const database = client.db("wedplandb")
 const usersCollection = database.collection("user")
 const servicesCollection = database.collection("services")
 const bookingsCollection = database.collection("bookings")
